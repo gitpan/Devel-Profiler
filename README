@@ -1,4 +1,4 @@
-Devel::Profiler 0.02
+Devel::Profiler 0.03
 
 This module implements a Perl profiler that outputs profiling data in
 a format compatible with "dprofpp", Devel::DProf's profile analysis
@@ -9,30 +9,27 @@ reason to use this module.
 
 CHANGES
 
-   - Fixed implementation of caller() override to more closely match
-     normal behavior.
+   - Added hz option and code to scale output the hz.  This should
+     improve speed and smooth discrepencies between the accuracy of
+     times() and Time::HiRes.
 
-   - Added fork protection like Devel::DProf - only profile the parent.
+   - Added ability to pass options to Devel::Profiler::Apache.
 
-   - Added code to avoid instrumenting fake subs.  For details, see: 
+   - Allow package_filter to take an array of filters.
 
-       http://perlmonks.org/index.pl?node_id=168546
+   - Fixed bug where Devel::Profiler::Apache would initialize
+     Devel::Profiler more than once, resulting in garbled output.
 
-   - Added code to detect constant subs and avoid profiling them.
+   - Set required Perl version to 5.6.0 rather than 5.6.1.  Testing
+     needed.
 
-   - Added Devel::Profiler::Apache module which works like
-     Apache::DProf to provide profiling for Apache/mod_perl.
+   - Devel::Profiler::Apache now logs when it opens a new profiler
+     output file.
 
-   - Added check for dprofpp to Makefile.PL - thanks are due to
-     "Automated Perl Test Account" for the catch.
+   - Added sub_filter option to allow flexible exclusion of subs.
 
-   - Fixed bug under Test::More version 0.44 where Test::More was
-     confused by my attempts to test skip() itself.  Thanks to Andreas
-     Marcel Riechert for the report.
-
-   - Added package_filter option to allow more flexible control over
-     packages to be profiled.  Thanks to Simon Rosenthal for inspiring
-     this feature.
+   - Added Devel::Profiler::Apache to MANIFEST.  Now it will actually
+     be incldued in the release!  Thanks Jasper Zhao for the spot.
 
 INSTALLATION
 
@@ -51,9 +48,10 @@ greatest.
 
 This module requires these other modules and libraries:
 
+   B   
    Time::HiRes
-   Carp
-   B
+   File::Path
+   Test::More
 
 COPYRIGHT AND LICENCE
 

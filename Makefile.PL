@@ -1,7 +1,7 @@
 use ExtUtils::MakeMaker;
 
-# 5.6.1 required at the moment, might backport later
-use 5.006001;
+# 5.6.0 required at the moment, might backport further later
+use 5.006;
 
 # check that dprofpp is available - we need it for "make test"
 `dprofpp -V` or die <<END;

@@ -28,3 +28,26 @@ Revision history for Perl extension Devel::Profiler.
    - Added package_filter option to allow more flexible control over
      packages to be profiled.  Thanks to Simon Rosenthal for inspiring
      this feature.
+
+0.03  Tue Jun  4 16:54:03 EDT 2002
+   - Added hz option and code to scale output the hz.  This should
+     improve speed and smooth discrepencies between the accuracy of
+     times() and Time::HiRes.
+
+   - Added ability to pass options to Devel::Profiler::Apache.
+
+   - Allow package_filter to take an array of filters.
+
+   - Fixed bug where Devel::Profiler::Apache would initialize
+     Devel::Profiler more than once, resulting in garbled output.
+
+   - Set required Perl version to 5.6.0 rather than 5.6.1.  Testing
+     needed.
+
+   - Devel::Profiler::Apache now logs when it opens a new profiler
+     output file.
+
+   - Added sub_filter option to allow flexible exclusion of subs.
+
+   - Added Devel::Profiler::Apache to MANIFEST.  Now it will actually
+     be incldued in the release!  Thanks Jasper Zhao for the spot.

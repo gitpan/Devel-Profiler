@@ -1,6 +1,6 @@
 package Devel::Profiler::Test;
 
-use 5.006001;
+use 5.006;
 use strict;
 use warnings;
 
@@ -15,15 +15,16 @@ use Test::More;
 
 # run some code through the profiler
 sub profile_code {
-    my $code = shift;
-    my $msg  = shift;
+    my $code      = shift;
+    my $msg       = shift;
+    my $use_line  = shift || "use Devel::Profiler;";
 
     # clean up old tmon.out
     unlink 'tmon.out' if -e 'tmon.out';
 
     # write temporary script
     open(SCRIPT, '>', 'script.pl') or die "Unable to open script.pl : $!";
-    print SCRIPT $code, "\nprint \"ok\\n\";\n";
+    print SCRIPT "$use_line\n$code\nprint \"ok\\n\";\n";
     close(SCRIPT)                  or die "Unable to close script.pl : $!";
     
     if ($ENV{TEST_DPROF}) {
@@ -32,7 +33,7 @@ sub profile_code {
           or die "Unable to run script.pl : $!";
     } else {
         # run script using Devel::Profiler
-        open(OUT, "$^X -Iblib -I. -MDevel::Profiler script.pl|")
+        open(OUT, "$^X -Iblib -I. script.pl|")
           or die "Unable to run script.pl : $!";
     }
     my $out = join('',<OUT>);

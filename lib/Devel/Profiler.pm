@@ -1,10 +1,10 @@
 package Devel::Profiler;
 
-use 5.006001;
+use 5.006;
 use strict;
 use warnings;
 
-our $VERSION = 0.02;
+our $VERSION = 0.03;
 
 use B;
 use Time::HiRes qw(time);
@@ -56,7 +56,15 @@ sub import {
     die "Invalid import options for Devel::Profiler " . 
       "- must be a list of key-value pairs."
         if @_ % 2;
-    
+
+    # check for typos
+    for (my $i = 0; $i < @_; $i += 2) {
+        die "Unknown option name for Devel::Profiler : '$_[$i]'."
+          unless grep { $_[$i] eq $_ } qw(output_file bad_pkgs bad_subs
+                                          buffer_size override_caller
+                                          package_filter sub_filter hz);
+    }
+
     # setup defaults and allow @_ to override
     our %OPT = ( output_file     => 'tmon.out',
                  bad_pkgs        => [qw(UNIVERSAL Time::HiRes B Carp Exporter
@@ -65,19 +73,32 @@ sub import {
                  bad_subs        => [],
                  buffer_size     => 64 * 1024,
                  override_caller => 1,
-                 package_filter  => 0,
+                 package_filter  => [],
+                 sub_filter      => [],
+                 hz              => 1000,
                  @_ );
 
     # push on list of pkgs to always avoid
     push @{$OPT{bad_pkgs}}, "Devel::Profiler", "DB";
 
     # compile lists into hashes for faster lookup
-    $OPT{bad_pkgs} = { map { ("${_}::", 1) } @{$OPT{bad_pkgs}} };
+    $OPT{bad_pkgs} = { map { ($_, 1) } @{$OPT{bad_pkgs}} };
     $OPT{bad_subs} = { map { ($_, 1) } @{$OPT{bad_subs}} };
+
+    # make sure package_filter is an array
+    $OPT{package_filter} = [ $OPT{package_filter} ]
+      unless ref $OPT{package_filter} eq 'ARRAY';
+
+    # make sure sub_filter is an array
+    $OPT{sub_filter} = [ $OPT{sub_filter} ]
+      unless ref $OPT{sub_filter} eq 'ARRAY';
       
     # promote buffer size to global, it's used in profile_sub too
     # frequently to be accessed in a hash
     our $BUFFER_SIZE = $OPT{buffer_size};
+
+    # same for hz
+    our $HZ = $OPT{hz};
 
     # override caller
     *CORE::GLOBAL::caller = \&my_caller
@@ -96,19 +117,11 @@ sub scan {
     my ($sym, $glob, $code);
 
     my @pkgs = ('main::');    
-    while (@pkgs) {
+  PKG: while (@pkgs) {
         my $pkg = pop @pkgs;
-
-        # check stop-list
-        next if exists $OPT{bad_pkgs}{$pkg};
- 
-        # check package filter if we have one
-        if ($OPT{package_filter}) {
-            next unless $OPT{package_filter}->($pkg);
-        }
-
-        # don't profile pragmata
-        next if $pkg =~ /^[a-z\:]+$/ and $pkg ne 'main::';
+        
+        # is it a bad package?
+        next if is_bad_pkg($pkg);
 
         # haven't I seen this place before?
         next if exists $saw_pkg{$pkg}; $saw_pkg{$pkg} = 1;           
@@ -138,6 +151,50 @@ sub scan {
     }
 }
 
+sub is_bad_pkg {
+    my $pkg = shift;
+    our %OPT;
+
+    # take off trailing ::
+    substr($pkg, -2, 2) = "";
+
+    # check stop-list
+    return 1 if exists $OPT{bad_pkgs}{$pkg};
+
+    # don't profile pragmata
+    return 1 if $pkg =~ /^[a-z\:]+$/ and $pkg ne 'main';
+    
+    # check package filters if we have any
+    if ($OPT{package_filter}) {
+        foreach my $filter (@{$OPT{package_filter}}) {
+            return 1 unless $filter->($pkg);
+        }
+    }
+
+    return 0;
+}
+
+# check sub tables
+sub is_bad_sub {
+    my ($pkg, $sub) = @_;
+    our %OPT;
+
+    # check stop-list
+    return 1 if exists $OPT{bad_subs}{"$pkg$sub"};
+
+    # take off trailing ::
+    substr($pkg, -2, 2) = "";
+
+    # check sub filters if we have any
+    if ($OPT{sub_filter}) {
+        foreach my $filter (@{$OPT{sub_filter}}) {
+            return 1 unless $filter->($pkg, $sub);
+        }
+    }
+
+    return 0;
+}
+
 # instrument a single subroutine
 sub instrument {
     my ($pkg, $sym, $code) = @_;
@@ -148,6 +205,9 @@ sub instrument {
     print STDERR __PACKAGE__ . 
       "::instrument($pkg, $sym) called.\n"
         if DEBUG;
+
+    # is this a bad sub
+    return if is_bad_sub($pkg, $sym);
 
     # never profile DESTROY
     return if $sym eq 'DESTROY';
@@ -168,7 +228,8 @@ sub instrument {
             instrument($real_pkg, $sym, \&{$name});
         }
         if (exists $my_code{$real_name}) {
-            no strict 'refs';            no warnings 'redefine';
+            no strict 'refs';
+            no warnings 'redefine';
             *{$name} = \&{$real_name};
         }
         return;
@@ -359,7 +420,7 @@ sub profile_sub {
 
 # open output file
 sub start_output {
-    our (%OPT, $BUFFER, $BUFFER_SIZE, $PID);
+    our (%OPT, $BUFFER, $BUFFER_SIZE, $PID, $HZ);
 
     # only open files in the parent
     return unless $PID == $$;
@@ -388,7 +449,7 @@ sub start_output {
     # output the preamble
     print FH <<END;
 #fOrTyTwO
-\$hz=1;
+\$hz=$HZ;
 \$XS_VERSION="Devel::Profiler $VERSION";
 \$over_utime=$user;
 \$over_stime=$sys;
@@ -411,16 +472,18 @@ END
 # profile_sub.
 sub emit_pulse {
     my $force = shift;
-    our ($RCLOCK, $UCLOCK, $SCLOCK, $BUFFER);
+    our ($RCLOCK, $UCLOCK, $SCLOCK, $BUFFER, $HZ);
     my  ($rtime, $utime, $stime, $relapse, $uelapse, $selapse);
     $rtime           = time;
     ($utime, $stime) = times;
-    $relapse         = $rtime - $RCLOCK;
-    $uelapse         = $utime - $UCLOCK;
-    $selapse         = $stime - $SCLOCK;
+
+    # get elapsed time in even HZ
+    $relapse         = int(($rtime - $RCLOCK) * $HZ);
+    $uelapse         = int(($utime - $UCLOCK) * $HZ);
+    $selapse         = int(($stime - $SCLOCK) * $HZ);
 
     # anything to report?
-    if (($relapse > 0.001) or $uelapse or $selapse or $force) {
+    if ($relapse or $uelapse or $selapse or $force) {
         $BUFFER .= "@ $uelapse $selapse $relapse\n";
 
         # update clocks
@@ -440,7 +503,7 @@ sub fake_exits {
 
 # empty buffer into OUTPUT
 sub empty_buffer {
-    our ($RCLOCK, $UCLOCK, $SCLOCK, $BUFFER, $PID);
+    our ($RCLOCK, $UCLOCK, $SCLOCK, $BUFFER, $PID, $HZ);
     
     # only output in the parent
     if ($PID != $$) {
@@ -456,9 +519,10 @@ sub empty_buffer {
     print FH $BUFFER;
     $BUFFER = "";
 
-    $relapse         = $rtime - $RCLOCK;
-    $uelapse         = $utime - $UCLOCK;
-    $selapse         = $stime - $SCLOCK;
+    # get elapsed time, in even HZ
+    $relapse         = int(($rtime - $RCLOCK) * $HZ);
+    $uelapse         = int(($utime - $UCLOCK) * $HZ);
+    $selapse         = int(($stime - $SCLOCK) * $HZ);
     if ($relapse or $uelapse or $selapse) {
         # use the magic Devel::DProf::write token that tells dprofpp
         # to ignore this time
@@ -476,15 +540,15 @@ sub empty_buffer {
 # emit final times
 sub emit_final_times {
     our ($RCLOCK_START, $UCLOCK_START, $SCLOCK_START, $OUTPUT_RESULTS_AT, 
-         $PID);
+         $PID, $HZ);
     return unless $PID == $$;
 
     our $RCLOCK            = time;
     our ($UCLOCK, $SCLOCK) = times;    
     
-    my $rfinal = $RCLOCK - $RCLOCK_START;
-    my $ufinal = $UCLOCK - $UCLOCK_START;
-    my $sfinal = $SCLOCK - $SCLOCK_START;
+    my $rfinal = int(($RCLOCK - $RCLOCK_START) * $HZ);
+    my $ufinal = int(($UCLOCK - $UCLOCK_START) * $HZ);
+    my $sfinal = int(($SCLOCK - $SCLOCK_START) * $HZ);
     
     # seek to the right place
     seek(FH, $OUTPUT_RESULTS_AT, 0) or die "Unable to seek : $!";
@@ -512,6 +576,7 @@ sub start_clock {
 
 # determine the profiling overhead
 sub test_overhead {
+    our $HZ;
     my $n = 10000; # how many times to run the test sub
     my ($utime1, $stime1, $rtime1, $utime2, $stime2, $rtime2);
 
@@ -545,9 +610,9 @@ sub test_overhead {
     my $rtime_inst = $rtime2 - $rtime1;
 
     return ($n,
-            $rtime_inst - $rtime_base, 
-            $utime_inst - $utime_base, 
-            $stime_inst - $stime_base);
+            int(($rtime_inst - $rtime_base) * $HZ),
+            int(($utime_inst - $utime_base) * $HZ),
+            int(($stime_inst - $stime_base) * $HZ));
 }
 
 # used to test call overhead.
@@ -765,7 +830,7 @@ allowing you to construct a callback that will be used to control
 which packages are profiled.  When the callback returns true the
 package will be profiled, false and it will not.  A false return will
 also inhibit profiling of child packages, so be sure to allow
-'main::'!  Packages will be passed to the callback with a trailing ::.
+'main'!
 
 For example, to never profile packages in the Apache namespace you
 would write:
@@ -781,11 +846,32 @@ The callback is consider after consulting bad_pkgs, so you will still
 need to modify bad_pkgs if you intend to profile a default member of
 that list.
 
+If you pass an array-ref to package_filter you can specify a list of
+filters.  These will be consulted in-order with the first to return 0
+causing the package to be discarded, like a short-circuiting "and"
+operator.
+
 =item bad_subs
 
 You can specify an array-ref containing a list of subs not to profile.
 There are no items in this list by default.  Be sure to specify the
 fully-qualified name - i.e. "Time::HiRes::time" not just "time".
+
+=item sub_filter
+
+The sub_filter option allows you to specify one or more callbacks to
+be used to decide whether to profile a subroutine or not.  The callbacks
+will recieve two parameters - the package name and the subroutine
+name.
+
+For example, to avoid wrapping all upper-case subroutines:
+
+  use Devel::Profiler 
+    sub_filter => sub { 
+                         my ($pkg, $sub) = @_;
+                         return 0 if $sub =~ /^[A-Z_]+$/;
+                         return 1;
+                      };
 
 =item override_caller
 
@@ -795,6 +881,15 @@ and keep code that depends on caller() working under the profiler.
 Set this option to 0 to inhibit this behavior.  Be aware that this is
 likely to break many modules, particularly ones that implement their
 own exporting.
+
+=item hz
+
+This variable sets the number of ticks-per-second in the timing
+routines.  By default it is set to 1000, which should be good enough
+to capture the accuracy of most times() implementations without
+spamming the output file with timestamps.  Setting this too low will
+reduce the accuracy of your data.  In general you should not need to
+change this setting.
 
 =head1 CAVEATS
 
@@ -830,6 +925,12 @@ Devel::Profiler won't capture time used before execution begins - for
 example, in BEGIN blocks.  I think of this as an advantage since I
 rarely need to optimize initialization performance, but for frequently
 run programs this might unfortunate.
+
+=item *
+
+Overloading causes Devel::Profiler serious indigestion.  You'll have
+to exclude overloading packages with bad_pkgs or package_filter until
+this changes.
 
 =back
 
@@ -870,6 +971,10 @@ that's called for every test.  Either way, something needs fixing.
 
 Add better support for AUTOLOAD in all its myriad uses.
 
+=item *
+
+Find a way to either ignore or handle overloaded packages.
+
 =back
 
 =head1 BUGS
@@ -900,6 +1005,7 @@ feature suggestions and/or code patches:
   Automated Perl Test Account
   Andreas Marcel Riechert
   Simon Rosenthal
+  Jasper Zhao
 
 Thanks!
 
