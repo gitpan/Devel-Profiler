@@ -4,7 +4,7 @@ use 5.006;
 use strict;
 use warnings;
 
-our $VERSION = 0.03;
+our $VERSION = 0.04;
 
 use B;
 use Time::HiRes qw(time);
@@ -18,9 +18,25 @@ use constant DEBUG => $ENV{DEVEL_PROFILER_DEBUG} || 0;
 # scan for subroutines 
 INIT { init() }
 
-# at the end, write final results and close output file
-END {
-    print STDERR __PACKAGE__ . "::END called\n" if DEBUG;
+# finish up
+END { end() }
+
+# initialize module
+sub init {
+    print STDERR __PACKAGE__ . "::init() called\n" if DEBUG;
+    our $INIT = 1;
+    our $PID = $$; # remember pid
+    start_output();
+    scan();
+    start_clock();
+    emit_pulse(1);
+}
+
+# write final results and close output file
+sub end {
+    our $INIT;
+    return unless $INIT;
+    print STDERR __PACKAGE__ . "::end() called\n" if DEBUG;
 
     # fake exits for subs remaining on stack.  Devel::DProf doesn't
     # bother, preferring to leave it to dprofpp -F.
@@ -36,16 +52,6 @@ END {
     if ($PID == $$) {
         close(FH) or die "Unable to close Devel::Profiler output file: $!";
     }
-}
-
-# initialize module
-sub init {
-    print STDERR __PACKAGE__ . "::init() called\n" if DEBUG;
-    our $PID = $$; # remember pid
-    start_output();
-    scan();
-    start_clock();
-    emit_pulse(1);
 }
 
 # take parameters from use line
@@ -111,7 +117,8 @@ sub import {
 
 # traverse all packages intrumenting all subroutines found
 sub scan {
-    our %OPT;
+    our (%OPT, $INIT);
+    return unless $INIT;
     my %saw_pkg;  # packages touched on this pass
 
     my ($sym, $glob, $code);
@@ -154,23 +161,39 @@ sub scan {
 sub is_bad_pkg {
     my $pkg = shift;
     our %OPT;
+    our %KNOWN_PKGS;
 
     # take off trailing ::
     substr($pkg, -2, 2) = "";
 
+    # check cache to avoid calling package filters thousands of times
+    if (exists $KNOWN_PKGS{$pkg}) {
+        return $KNOWN_PKGS{$pkg};
+    }
+
     # check stop-list
-    return 1 if exists $OPT{bad_pkgs}{$pkg};
+    elsif (exists $OPT{bad_pkgs}{$pkg}) {
+        $KNOWN_PKGS{$pkg} = 1;
+        return 1;
+    }
 
     # don't profile pragmata
-    return 1 if $pkg =~ /^[a-z\:]+$/ and $pkg ne 'main';
+    elsif ($pkg =~ /^[a-z\:]+$/ and $pkg ne 'main') {
+        $KNOWN_PKGS{$pkg} = 1;
+        return 1;
+    }
     
     # check package filters if we have any
-    if ($OPT{package_filter}) {
+    elsif ($OPT{package_filter}) {
         foreach my $filter (@{$OPT{package_filter}}) {
-            return 1 unless $filter->($pkg);
+            unless ($filter->($pkg)) {
+                $KNOWN_PKGS{$pkg} = 1;
+                return 1;
+            }
         }
     }
 
+    $KNOWN_PKGS{$pkg} = 0;
     return 0;
 }
 
@@ -179,13 +202,14 @@ sub is_bad_sub {
     my ($pkg, $sub) = @_;
     our %OPT;
 
-    # check stop-list
-    return 1 if exists $OPT{bad_subs}{"$pkg$sub"};
+    # check package
+    return 1 if is_bad_pkg($pkg);
 
     # take off trailing ::
     substr($pkg, -2, 2) = "";
 
-    # check sub filters if we have any
+    # check sub filters if we have any (not worth caching because subs
+    # are checked usually only once or twice)
     if ($OPT{sub_filter}) {
         foreach my $filter (@{$OPT{sub_filter}}) {
             return 1 unless $filter->($pkg, $sub);

@@ -51,3 +51,10 @@ Revision history for Perl extension Devel::Profiler.
 
    - Added Devel::Profiler::Apache to MANIFEST.  Now it will actually
      be incldued in the release!  Thanks Jasper Zhao for the spot.
+
+0.04 Mon Jun 10 16:53:55 EDT 2002
+   - Fixed bug where exported subs could sneak around package_filter
+     unless they were checked again in sub_filter.
+
+   - Fixed some undefined value warnings when module is loaded but not
+     initialized.
