@@ -1,0 +1,13 @@
+Changes
+Makefile.PL
+MANIFEST
+lib/Devel/Profiler.pm
+lib/Devel/Profiler/Test.pm
+README
+t/01basic.t
+t/02die.t
+t/03goto.t
+t/04crash.t
+t/05packages.t
+t/06caller.t
+t/07constants.t
