@@ -80,7 +80,7 @@ sub get_times {
     close DPROF;
 
     my ($user)  = $out =~ /User\s+Time\s+=\s+([\d\.]+)/;
-
+    
     return ($real, $sys, $user);
 }
 

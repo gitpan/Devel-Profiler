@@ -1,4 +1,4 @@
-Devel::Profiler - a Perl profiler compatible with dprofpp
+Devel::Profiler 0.02
 
 This module implements a Perl profiler that outputs profiling data in
 a format compatible with "dprofpp", Devel::DProf's profile analysis
@@ -6,6 +6,33 @@ tool.  It is meant to be a drop-in replacement for Devel::DProf.
 
 NOTE: If Devel::DProf works for your application then there is no
 reason to use this module.
+
+CHANGES
+
+   - Fixed implementation of caller() override to more closely match
+     normal behavior.
+
+   - Added fork protection like Devel::DProf - only profile the parent.
+
+   - Added code to avoid instrumenting fake subs.  For details, see: 
+
+       http://perlmonks.org/index.pl?node_id=168546
+
+   - Added code to detect constant subs and avoid profiling them.
+
+   - Added Devel::Profiler::Apache module which works like
+     Apache::DProf to provide profiling for Apache/mod_perl.
+
+   - Added check for dprofpp to Makefile.PL - thanks are due to
+     "Automated Perl Test Account" for the catch.
+
+   - Fixed bug under Test::More version 0.44 where Test::More was
+     confused by my attempts to test skip() itself.  Thanks to Andreas
+     Marcel Riechert for the report.
+
+   - Added package_filter option to allow more flexible control over
+     packages to be profiled.  Thanks to Simon Rosenthal for inspiring
+     this feature.
 
 INSTALLATION
 

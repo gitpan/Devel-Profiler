@@ -4,10 +4,9 @@ use 5.006001;
 use strict;
 use warnings;
 
-our $VERSION = 0.01;
+our $VERSION = 0.02;
 
 use B;
-use Carp qw(croak);
 use Time::HiRes qw(time);
 
 # set this to see a running chatter from the module.  Don't do this
@@ -17,16 +16,14 @@ use Time::HiRes qw(time);
 use constant DEBUG => $ENV{DEVEL_PROFILER_DEBUG} || 0;
 
 # scan for subroutines 
-INIT { 
-    start_output();
-    scan();
-    start_clock();
-    emit_pulse(1);
-}
+INIT { init() }
 
 # at the end, write final results and close output file
 END {
-    # fake exits for subs remaining on stack
+    print STDERR __PACKAGE__ . "::END called\n" if DEBUG;
+
+    # fake exits for subs remaining on stack.  Devel::DProf doesn't
+    # bother, preferring to leave it to dprofpp -F.
     fake_exits();
 
     # empty the buffer
@@ -35,7 +32,20 @@ END {
     # emit the final timings
     emit_final_times();
 
-    close OUTPUT;
+    our $PID;
+    if ($PID == $$) {
+        close(FH) or die "Unable to close Devel::Profiler output file: $!";
+    }
+}
+
+# initialize module
+sub init {
+    print STDERR __PACKAGE__ . "::init() called\n" if DEBUG;
+    our $PID = $$; # remember pid
+    start_output();
+    scan();
+    start_clock();
+    emit_pulse(1);
 }
 
 # take parameters from use line
@@ -43,18 +53,19 @@ sub import {
     my $pkg = shift;
     print STDERR __PACKAGE__ . "::import(", join(', ', @_), ") called\n"
       if DEBUG;
-    croak "Invalid import options - must be a list of key-value pairs."
-      if @_ % 2;
+    die "Invalid import options for Devel::Profiler " . 
+      "- must be a list of key-value pairs."
+        if @_ % 2;
     
     # setup defaults and allow @_ to override
     our %OPT = ( output_file     => 'tmon.out',
                  bad_pkgs        => [qw(UNIVERSAL Time::HiRes B Carp Exporter
-                                     warnings Cwd Config CORE blib strict 
-                                     DynaLoader vars XSLoader AutoLoader
-                                     base)],
+                                        Cwd Config CORE DynaLoader XSLoader
+                                        AutoLoader)],
                  bad_subs        => [],
                  buffer_size     => 64 * 1024,
                  override_caller => 1,
+                 package_filter  => 0,
                  @_ );
 
     # push on list of pkgs to always avoid
@@ -90,6 +101,11 @@ sub scan {
 
         # check stop-list
         next if exists $OPT{bad_pkgs}{$pkg};
+ 
+        # check package filter if we have one
+        if ($OPT{package_filter}) {
+            next unless $OPT{package_filter}->($pkg);
+        }
 
         # don't profile pragmata
         next if $pkg =~ /^[a-z\:]+$/ and $pkg ne 'main::';
@@ -115,7 +131,9 @@ sub scan {
             }
             
             # found a code ref?  then instrument it
-            instrument($pkg, $sym, $code) if defined($code = *{$glob}{CODE});
+            instrument($pkg, $sym, $code) 
+              if defined($code = *{$glob}{CODE}) and ref $code eq 'CODE';
+              
         }
     }
 }
@@ -123,6 +141,7 @@ sub scan {
 # instrument a single subroutine
 sub instrument {
     my ($pkg, $sym, $code) = @_;
+    my $name = "$pkg$sym";
     our %OPT;
     our %my_code; # hash of code addresses of instrumented subroutines
 
@@ -130,41 +149,55 @@ sub instrument {
       "::instrument($pkg, $sym) called.\n"
         if DEBUG;
 
-    # find real subroutine name and package
-    my ($name, $disp_pkg) = get_real_package($pkg, $sym, $code);
+    # never profile DESTROY
+    return if $sym eq 'DESTROY';
 
-    # make sure this isn't a sub in a bad pkg
-    return if exists $OPT{bad_pkgs}{"${disp_pkg}::"};
+    # is this subroutine already instrumented?
+    return if exists $my_code{$name};
+
+    # is this subroutine a fake?  Trying to instrument fake subs leads
+    # to certains doom.  See: http://perlmonks.org/index.pl?node_id=168546
+    return unless defined(&{$name});
+    
+    # try to guess if this is an imported alias
+    my $real_pkg = get_real_package($code);
+    if (defined $real_pkg and $pkg ne $real_pkg) {
+        my $real_name = "$real_pkg$sym";
+        if (not exists $my_code{$real_name}) {
+            no strict 'refs';
+            instrument($real_pkg, $sym, \&{$name});
+        }
+        if (exists $my_code{$real_name}) {
+            no strict 'refs';            no warnings 'redefine';
+            *{$name} = \&{$real_name};
+        }
+        return;
+    }
+
+    # don't wrap AUTOLOAD - it breaks $AUTOLOAD for some reason
+    return if $name =~ /::AUTOLOAD$/;
     
     # check stop-list
-    return if exists $OPT{bad_subs}{$name} or 
-              exists $OPT{bad_subs}{"$pkg$sym"};
+    return if exists $OPT{bad_subs}{$name};
 
     # don't instrument constants
     return if is_constant($name, $code);
 
-    # key is the memory address of the sub
-    my $key = $code + 0;
-                
-    # is this subroutine already instrumented?
-    next if exists $my_code{$key};
-                
     # create a profiling stub for the sub
     no strict 'refs';
     no warnings 'redefine';	    
+    (my $pkg_name = $real_pkg) =~ s/\:\:$//;               
     if (defined(my $proto = prototype($name))) {
         # create wrapper around calling prof_code
-        *{"$pkg$sym"} = 
-          eval "sub ($proto) {profile_sub(\$disp_pkg,\$sym,\$code,\@_)}";
+        *{$name} = 
+          eval "sub ($proto) { profile_sub(\$pkg_name,\$sym,\$code,\@_) }";
     } else {
         # assign the prof code directly
-        *{"$pkg$sym"} = sub { profile_sub($disp_pkg, $sym, $code, @_); };
+        *{$name} = sub { profile_sub($pkg_name, $sym, $code, @_); };
     }
-          
-    # remember it
-    no strict 'refs';
-    $key = (*{"$pkg$sym"}{CODE}) + 0;
-    $my_code{$key} = 1;	    
+
+    # save prof_code for use later
+    $my_code{$name} = \&{$name};
 
     print STDERR __PACKAGE__ . 
       "::instrument installed sub for $name\n" 
@@ -172,19 +205,23 @@ sub instrument {
 }
 
 sub get_real_package {
-    my ($pkg, $sym, $code) = @_;
+    my $obj = B::svref_2object(shift);
+    return unless $obj and ref $obj eq 'B::CV';
 
-    # detect imported subs and correct package name
-    my ($obj, $stash, $stash_name, $name, $disp_pkg);
-    return ($stash_name . "::" . $sym, $stash_name)    
-      if ($obj = B::svref_2object($code) and
-          $obj->isa('B::CV')             and
-          ($stash = $obj->STASH)         and 
-          $stash->isa('B::HV')           and 
-          $stash_name = $stash->NAME);
+    my $gv  = $obj->GV;
+    return unless $gv  and ref $gv  eq 'B::GV';
 
-    # otherwise trust pkg and sym
-    return ("$pkg$sym", $pkg =~ /(.*)\:\:$/);
+    my $egv = $gv->EGV;
+    my $stash;
+    if ($egv and ref $egv eq 'B::GV') {
+        $stash = $egv->STASH;
+    } else {
+        $stash = $gv->STASH;
+    }
+    if ($stash and ref $stash eq 'B::HV') {
+        return $stash->NAME . '::';
+    }
+    return;
 }
 
 # detect constants - is this the only/best way to do it?
@@ -228,10 +265,10 @@ sub profile_sub {
     emit_pulse();
 
     # get id
-    my $id = $ID{"${pkg}::$sym"};
+    my $id = $ID{"$pkg$sym"};
     if (not defined $id) {
         # first entry into sub - assign new ID
-        $id = $ID{"${pkg}::$sym"} = ++$LAST_ID;
+        $id = $ID{"$pkg$sym"} = ++$LAST_ID;
         $BUFFER .= "& $id $pkg $sym\n";
     }
 
@@ -253,7 +290,7 @@ sub profile_sub {
         $BUFFER .= "+ $id\n";
     }
     
-    # push $id onto stack for return
+    # push $id and caller data onto stack for use later
     push(@STACK, $id);
 
     # need to empty buffer?
@@ -261,7 +298,7 @@ sub profile_sub {
 
     print STDERR __PACKAGE__, "::profile_sub calling ${pkg}::$sym ($id)\n"
       if DEBUG and $sym ne 'test_sub';
-    
+
     # make call, in correct context
     my $wantarray = wantarray;
     my ($ret, @ret);
@@ -276,7 +313,7 @@ sub profile_sub {
         }	 
     };
 
-    # get returned id from stack
+    # get returned id from stack, ignore caller data we won't need it now
     $id = pop @STACK;
 
     print STDERR __PACKAGE__, "::profile_sub ($id) returned\n"
@@ -322,8 +359,11 @@ sub profile_sub {
 
 # open output file
 sub start_output {
-    our (%OPT, $BUFFER, $BUFFER_SIZE);
+    our (%OPT, $BUFFER, $BUFFER_SIZE, $PID);
 
+    # only open files in the parent
+    return unless $PID == $$;
+ 
     # make sure we don't try to write any output while testing
     local $BUFFER_SIZE = 1024 * 1024 * 1024;
 
@@ -338,11 +378,15 @@ sub start_output {
     $BUFFER = "";
 
     # open output file
-    open(OUTPUT, '>', $OPT{output_file}) 
-      or croak("Unable to open output file \"$OPT{output_file}\" : $!");
+    open(FH, ">", $OPT{output_file}) or
+      die "Unable to open output file \"$OPT{output_file}\" : $!";
+
+    print STDERR __PACKAGE__,
+      "::start_output : opened $OPT{output_file} for output.\n"
+        if DEBUG;
 
     # output the preamble
-    print OUTPUT <<END;
+    print FH <<END;
 #fOrTyTwO
 \$hz=1;
 \$XS_VERSION="Devel::Profiler $VERSION";
@@ -353,13 +397,13 @@ sub start_output {
 END
 
     # note location to put final times
-    our $OUTPUT_RESULTS_AT = tell OUTPUT;
+    our $OUTPUT_RESULTS_AT = tell(FH);
 
     # pad with room for results
-    print OUTPUT " " x 255, "\n";
+    print FH " " x 255, "\n";
 
     # print token to start profiling section
-    print OUTPUT "PART2\n";
+    print FH "PART2\n";
 }
 
 
@@ -396,14 +440,20 @@ sub fake_exits {
 
 # empty buffer into OUTPUT
 sub empty_buffer {
-    our ($RCLOCK, $UCLOCK, $SCLOCK, $BUFFER);
+    our ($RCLOCK, $UCLOCK, $SCLOCK, $BUFFER, $PID);
     
+    # only output in the parent
+    if ($PID != $$) {
+        $BUFFER = "";
+        return;
+    }
+
     # start a timer to see if this is worth excluding from profile
     my  ($rtime, $utime, $stime, $relapse, $uelapse, $selapse);
     $rtime           = time;
     ($utime, $stime) = times;
 
-    print OUTPUT $BUFFER;
+    print FH $BUFFER;
     $BUFFER = "";
 
     $relapse         = $rtime - $RCLOCK;
@@ -412,9 +462,9 @@ sub empty_buffer {
     if ($relapse or $uelapse or $selapse) {
         # use the magic Devel::DProf::write token that tells dprofpp
         # to ignore this time
-        print OUTPUT "+ & Devel::DProf::write\n";
-        print OUTPUT "@ $uelapse $selapse $relapse\n";        
-        print OUTPUT "- & Devel::DProf::write\n";
+        print FH "+ & Devel::DProf::write\n",
+                  "@ $uelapse $selapse $relapse\n",
+                  "- & Devel::DProf::write\n";
 
         # update clock
         $RCLOCK = $rtime;
@@ -425,17 +475,20 @@ sub empty_buffer {
 
 # emit final times
 sub emit_final_times {
-    our ($RCLOCK_START, $UCLOCK_START, $SCLOCK_START, $OUTPUT_RESULTS_AT);
+    our ($RCLOCK_START, $UCLOCK_START, $SCLOCK_START, $OUTPUT_RESULTS_AT, 
+         $PID);
+    return unless $PID == $$;
+
     our $RCLOCK            = time;
-    our ($UCLOCK, $SCLOCK) = times;
+    our ($UCLOCK, $SCLOCK) = times;    
     
     my $rfinal = $RCLOCK - $RCLOCK_START;
     my $ufinal = $UCLOCK - $UCLOCK_START;
     my $sfinal = $SCLOCK - $SCLOCK_START;
     
     # seek to the right place
-    seek(OUTPUT, $OUTPUT_RESULTS_AT, 0) or die "Unable to seek : $!";
-    print OUTPUT <<END
+    seek(FH, $OUTPUT_RESULTS_AT, 0) or die "Unable to seek : $!";
+    print FH <<END
 \$rrun_utime=$ufinal;
 \$rrun_stime=$sfinal;
 \$rrun_rtime=$rfinal;
@@ -459,7 +512,7 @@ sub start_clock {
 
 # determine the profiling overhead
 sub test_overhead {
-    my $n = 20000; # how many times to run the test sub
+    my $n = 10000; # how many times to run the test sub
     my ($utime1, $stime1, $rtime1, $utime2, $stime2, $rtime2);
 
     # first get times without instrumenting
@@ -505,43 +558,70 @@ sub test_sub { }
 # These are installed at INIT along with instrumented subs.
 #
 
+# override for caller() that ignores Devel::Profiler frames
 sub my_caller {
     my $arg = shift;
-    print STDERR __PACKAGE__ . "::caller(", 
-      (defined($arg) ? $arg : "undef"), ")\n"
-        if DEBUG;
+    my $target = defined $arg ? $arg : 0;
+    my $found = -1;
+    my @stack;
 
-    my $target = defined $arg ? $arg : 1;
+    print STDERR __PACKAGE__,"::caller(",(defined($arg) ? $arg : "undef"),")\n"
+      if DEBUG;
+    dump_caller() if DEBUG > 1;
 
-    my $i = 0;
-    my $real_frames = 0;
-    my @caller;
-    while (($target + 1) > $real_frames) {
-        @caller = CORE::caller($i++);
-        print STDERR "CALLER($i) => [", 
-          (map { defined $_ ? "\n\t$_" : "\n\t(undef)" } @caller), "\n]\n"
-            if DEBUG;
+    # step through stack frames accumulating good ones
+    my $i = 1;
+    while(my @caller = CORE::caller($i++)) {
+        push(@stack, \@caller); # save for later
 
-        return @caller unless @caller; # end of the line - no point
-                                       # looking futher
+        # is this a bad one?
+        next if $caller[0] eq 'Devel::Profiler';
 
-        # is this a real frame?
-        $real_frames++ unless ($caller[3] =~ /^Devel::Profiler/ or 
-                               ($caller[0] eq 'Devel::Profiler' and
-                                $caller[3] eq '(eval)'));
-        print STDERR "REAL_FRAMES=$real_frames\n" if DEBUG;
+        # is this a profiled sub?  if so, patch up from 3 frames up
+        if ($caller[3] eq 'Devel::Profiler::__ANON__') {
+            @caller[3..9] = @{$stack[($i - 5)]}[3..9];
+        }
+        
+        # all done?
+        last if ++$found == $target;
     }
 
-    print STDERR "Returning CALLER($i) => [", 
-      (map { defined $_ ? "\n\t$_" : "\n\t(undef)" } @caller), "\n]\n"
+    # return nothing if we didn't find it
+    return unless $found == $target;
+
+    # return the top of the stack or nothing
+    my $c = @stack ? $stack[-1] : [];
+
+    print STDERR "Returning CALLER($target) => [", 
+      (map { defined $_ ? "\n\t$_" : "\n\t(undef)" } @$c), "\n]\n"
         if DEBUG;
 
     if (wantarray) {
-        return defined $arg ? @caller : @caller[0,1,2];
+        return defined $arg ? @$c : @{$c}[0,1,2];
     } else {
-        return $caller[0];
+        return $c->[0];
     }
 }
+
+#
+# debugging routines
+#
+
+# pretty-prints the call stack to STDERR
+sub dump_caller {
+    my $i = 0;
+    my @caller;
+    my @names = qw(package filename line subroutine hasargs
+                   wantarray evaltext is_require hints bitmask);
+    while (@caller = CORE::caller($i + 1)) {
+        print STDERR "-"x3, " Frame [$i] ", "-"x50, "\n";
+        for (0 .. $#caller) {
+            printf STDERR "%15s => %s\n", $names[$_], 
+              (defined $caller[$_] ? $caller[$_] : "(undef)");
+        }
+        $i++;
+    }
+}  
 
 
 1;
@@ -568,6 +648,10 @@ C<tmon.out>):
   $ dprofpp
 
 See the C<dprofpp> man page for details on examining the output.
+
+For Apache/mod_perl profiling see the
+L<Devel::Profiler::Apache|Devel::Profiler::Apache> module included
+with Devel::Profiler.
 
 =head1 DESCRIPTION
 
@@ -656,13 +740,16 @@ will write data to disk as soon as it is available.
 Devel::Profiler can skip profiling subroutines in a configurable list
 of packages.  The default list is:
 
-  [qw(UNIVERSAL Time::HiRes B Carp Exporter warnings Cwd Config CORE
-      blib strict DynaLoader vars XSLoader AutoLoader base          )]
+  [qw(UNIVERSAL Time::HiRes B Carp Exporter Cwd Config CORE DynaLoader
+   XSLoader AutoLoader)]
 
 You can specify your own array-ref of packages to avoid using this
 option.  Note that by using this option you're overwriting the list
 not adding to it.  As a result you'll generally want to include at
 many of the packages listed above in your list.
+
+Devel::Profiler never profiles pragmatic modules which are in all
+lower-case.
 
 In addition the DB package is always skipped since trying to
 instrument the subroutines in DB will crash Perl.
@@ -670,6 +757,29 @@ instrument the subroutines in DB will crash Perl.
 Finally, Devel::Profiler never profiles pragmatic modules which it
 detects by their being entirely lower-case.  Example of pragmatic
 modules you've probably heard of are "strict", "warnings", etc.
+
+=item package_filter
+
+This option allows you to handle package selection more flexibly by
+allowing you to construct a callback that will be used to control
+which packages are profiled.  When the callback returns true the
+package will be profiled, false and it will not.  A false return will
+also inhibit profiling of child packages, so be sure to allow
+'main::'!  Packages will be passed to the callback with a trailing ::.
+
+For example, to never profile packages in the Apache namespace you
+would write:
+
+  use Devel::Profiler 
+    package_filter => sub { 
+                          my $pkg = shift;
+                          return 0 if $pkg =~ /^Apache/;
+                          return 1;
+                      };
+
+The callback is consider after consulting bad_pkgs, so you will still
+need to modify bad_pkgs if you intend to profile a default member of
+that list.
 
 =item bad_subs
 
@@ -682,7 +792,9 @@ fully-qualified name - i.e. "Time::HiRes::time" not just "time".
 By default Devel::Profiler will override Perl's builtin caller().  The
 overriden caller() will ignore the frames generated by Devel::Profiler
 and keep code that depends on caller() working under the profiler.
-Set this option to 0 to inhibit this behavior.
+Set this option to 0 to inhibit this behavior.  Be aware that this is
+likely to break many modules, particularly ones that implement their
+own exporting.
 
 =head1 CAVEATS
 
@@ -694,9 +806,10 @@ acknowledged.  Here they are:
 =item *
 
 Devel::Profiler doesn't profile anonymous subroutines.  It works by
-walking package symbol tables it won't ever notice routines with no
+walking package symbol tables so it won't notice routines with no
 names.  As a result the time spent in anonymous subroutines is
-credited to their named callers.  This may change in the future.
+credited to their named callers.  This may change in the future, but
+if it does I'll add an option to restrict the profiler to named subs.
 
 =item *
 
@@ -733,12 +846,6 @@ and B::Generate?  Good grief.
 
 =item *
 
-Add more tests for caller() and improve implementation accordingly.
-The current one works for simple uses but it still leaks information
-about Devel::Profiler.
-
-=item *
-
 Allow users to request a re-scan for subs.  This is almost possible by
 calling scan() except that scan() is missing code to inhibit
 profiling while scanning.
@@ -750,22 +857,18 @@ for subs.  (Requires todo above to avoid horking the results.)
 
 =item *
 
-Figure out a way to avoid instrumenting constant subs.
-
-=item *
-
-Add protection against fork() like Devel::DProf has.
-
-=item *
-
 Do research into the differences between Devel::DProf's output and
 Devel::Profiler's.  Usually they are quite close but occasionally they
 disagree by orders of magnitude.  For example, running
 HTML::Template's test suite under Devel::DProf shows output() taking
 NO time but Devel::Profiler shows around 10% of the time is in
 output().  I don't know which to trust but my gut tells me something
-is wrong with Devel::DProf - output() is a big routine that's called
-for every test.  Either way, something needs fixing.
+is wrong with Devel::DProf.  HTML::Template::output() is a big routine
+that's called for every test.  Either way, something needs fixing.
+
+=item *
+
+Add better support for AUTOLOAD in all its myriad uses.
 
 =back
 
@@ -791,7 +894,14 @@ profiler was possible and that it need not rely on the buggy DB
 facilities.  Without seeing this module I probably would have given up
 on the project entirely.
 
-Thank you both!
+In addition, the following people have contributed bug reports,
+feature suggestions and/or code patches:
+
+  Automated Perl Test Account
+  Andreas Marcel Riechert
+  Simon Rosenthal
+
+Thanks!
 
 =head1 COPYRIGHT AND LICENSE
 

@@ -11,3 +11,6 @@ t/04crash.t
 t/05packages.t
 t/06caller.t
 t/07constants.t
+t/08fork.t
+t/09fcntl.t
+t/10autoload.t
